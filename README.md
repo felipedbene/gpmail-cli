@@ -45,3 +45,4 @@ python cli.py [--auto-send]
 Use `--auto-send` to send replies automatically without manual confirmation.
 
 The script checks your unread emails, uses GPT to decide if a response is needed and, when appropriate, drafts a reply for you to send.
+Replies are written in the same language as the incoming email. Messages that are detected as spam or marketing are automatically reported to Gmail instead of just being marked read.
