@@ -4,7 +4,7 @@ from email.mime.text import MIMEText
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-import openai
+from openai import OpenAI
 from google.auth.transport.requests import Request
 from dotenv import load_dotenv
 SCOPES = [
@@ -54,10 +54,10 @@ def get_header(message, name):
 def main(auto_send: bool = False):
     creds   = get_credentials()
     service = build('gmail', 'v1', credentials=creds)
-    openai.api_key = OPENAI_KEY
+    client = OpenAI(api_key=OPENAI_KEY)
 
-    resp = service.users().messages().list(userId='me', q='is:unread').execute()
-    for item in resp.get('messages', []):
+    gmail_resp = service.users().messages().list(userId='me', q='is:unread').execute()
+    for item in gmail_resp.get('messages', []):
         msg     = service.users().messages().get(userId='me', id=item['id'], format='full').execute()
         sender  = get_header(msg, 'From')
         subject = get_header(msg, 'Subject')
@@ -80,19 +80,17 @@ def main(auto_send: bool = False):
         }
 
         try:
-            chat_resp = openai.ChatCompletion.create(
+            chat_resp = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[system, user],
             )
 
-            result = json.loads(resp["choices"][0]["message"]["content"])
-            if "should_reply" not in result or "draft_reply" not in result:
-                raise ValueError("Missing keys in assistant response")
-
-            assistant_content = chat_resp["choices"][0]["message"]["content"]
+            assistant_content = chat_resp.choices[0].message.content
             data = json.loads(assistant_content)
             if not isinstance(data, dict):
                 raise ValueError("assistant reply must be an object")
+            if "should_reply" not in data or "draft_reply" not in data:
+                raise ValueError("Missing keys in assistant response")
             result = {
                 "should_reply": data.get("should_reply", "").strip(),
                 "draft_reply": data.get("draft_reply", ""),
