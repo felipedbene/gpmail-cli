@@ -1,5 +1,6 @@
 
 import os, json, base64, argparse
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.credentials import Credentials
@@ -51,10 +52,11 @@ def get_header(message, name):
             return h['value']
     return ""
 
-def main(auto_send: bool = False):
+def main(auto_send: bool = False, max_age_days: int = 7):
     creds   = get_credentials()
     service = build('gmail', 'v1', credentials=creds)
     client = OpenAI(api_key=OPENAI_KEY)
+    cutoff  = datetime.utcnow() - timedelta(days=max_age_days)
 
     print("Looking for unread messages...")
     gmail_resp = service.users().messages().list(userId='me', q='is:unread').execute()
@@ -63,10 +65,23 @@ def main(auto_send: bool = False):
     if not messages:
         return
     for item in messages:
-        msg     = service.users().messages().get(userId='me', id=item['id'], format='full').execute()
-        sender  = get_header(msg, 'From')
+        msg = service.users().messages().get(userId='me', id=item['id'], format='full').execute()
+        received_ts = int(msg.get('internalDate', '0')) / 1000
+        received_dt = datetime.utcfromtimestamp(received_ts) if received_ts else None
+        if received_dt and received_dt < cutoff:
+            service.users().messages().modify(
+                userId='me',
+                id=msg['id'],
+                body={'removeLabelIds': ['UNREAD']}
+            ).execute()
+            print(
+                f"Skipping '{msg.get('snippet', '')[:30]}...' from {received_dt.date()} older than {max_age_days} days."
+            )
+            continue
+
+        sender = get_header(msg, 'From')
         subject = get_header(msg, 'Subject')
-        body    = extract_plain_text(msg)
+        body = extract_plain_text(msg)
 
         print(f"Processing '{subject}' from {sender}...")
 
@@ -158,5 +173,7 @@ def main(auto_send: bool = False):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Process unread Gmail messages with GPT.')
     parser.add_argument('--auto-send', action='store_true', help='Send replies without confirmation')
+    parser.add_argument('--max-age-days', type=int, default=7,
+                        help='Ignore unread messages older than this many days')
     args = parser.parse_args()
-    main(auto_send=args.auto_send)
+    main(auto_send=args.auto_send, max_age_days=args.max_age_days)
