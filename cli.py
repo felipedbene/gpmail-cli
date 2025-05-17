@@ -76,6 +76,7 @@ def main(auto_send: bool = False):
             "content": (
                 "You are an email assistant. "
                 "Never respond to marketing or promotional messages even if they appear well written. "
+                "Be conservative when deciding a message is spam. Legitimate security notices, such as bank alerts about suspicious activity, are not marketing and should not be reported as spam. "
                 "Determine whether the email is spam or marketing and should be reported. "
                 "When a reply is required, draft it in the same language as the original email. "
                 "Output valid JSON with exactly three keys: "
