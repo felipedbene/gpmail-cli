@@ -46,4 +46,4 @@ Use `--auto-send` to send replies automatically without manual confirmation.
 `--max-age-days` controls how old unread messages can be before they are ignored (default: 7 days).
 
 The script checks your unread emails labelled as **Important**, skips newsletters and mailing lists when Gmail identifies them, and uses GPT only to decide if a response is needed and draft a reply when appropriate.
-Replies are written in the same language as the incoming email. Messages not requiring a reply are simply marked as read.
+Replies are written in the same language as the incoming email. When GPT decides no reply is needed, its reasoning is shown and the message is labeled `HumanActionNeeded-GPT` before being marked as read.
