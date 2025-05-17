@@ -39,7 +39,9 @@ OPENAI_API_KEY=YOUR_KEY_HERE
 Then run the CLI:
 
 ```bash
-python cli.py
+python cli.py [--auto-send]
 ```
+
+Use `--auto-send` to send replies automatically without manual confirmation.
 
 The script checks your unread emails, uses GPT to decide if a response is needed and, when appropriate, drafts a reply for you to send.

@@ -1,5 +1,5 @@
 
-import os, json, base64
+import os, json, base64, argparse
 from email.mime.text import MIMEText
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.credentials import Credentials
@@ -51,7 +51,7 @@ def get_header(message, name):
             return h['value']
     return ""
 
-def main():
+def main(auto_send: bool = False):
     creds   = get_credentials()
     service = build('gmail', 'v1', credentials=creds)
     openai.api_key = OPENAI_KEY
@@ -84,6 +84,8 @@ def main():
                 messages=[system, user],
             )
             result = json.loads(resp["choices"][0]["message"]["content"])
+            if "should_reply" not in result or "draft_reply" not in result:
+                raise ValueError("Missing keys in assistant response")
         except Exception as e:
             print("Failed to generate reply:", e)
             continue
@@ -91,9 +93,12 @@ def main():
         if result["should_reply"] == "YES":
             draft = result["draft_reply"].strip()
             print(f"\nFrom: {sender}\nSubject: {subject}\n\nDraft:\n{draft}\n")
-            if input("Send? (y/N) ").lower().startswith('y'):
+            send_it = auto_send
+            if not auto_send:
+                send_it = input("Send? (y/N) ").lower().startswith('y')
+            if send_it:
                 mime = MIMEText(draft)
-                mime['To']      = sender
+                mime['To'] = sender
                 mime['Subject'] = "Re: " + subject
                 raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
                 service.users().messages().send(userId='me', body={'raw': raw}).execute()
@@ -109,4 +114,7 @@ def main():
             ).execute()
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='Process unread Gmail messages with GPT.')
+    parser.add_argument('--auto-send', action='store_true', help='Send replies without confirmation')
+    args = parser.parse_args()
+    main(auto_send=args.auto_send)
