@@ -56,12 +56,19 @@ def main(auto_send: bool = False):
     service = build('gmail', 'v1', credentials=creds)
     client = OpenAI(api_key=OPENAI_KEY)
 
+    print("Looking for unread messages...")
     gmail_resp = service.users().messages().list(userId='me', q='is:unread').execute()
-    for item in gmail_resp.get('messages', []):
+    messages = gmail_resp.get('messages', [])
+    print(f"Found {len(messages)} unread message(s)")
+    if not messages:
+        return
+    for item in messages:
         msg     = service.users().messages().get(userId='me', id=item['id'], format='full').execute()
         sender  = get_header(msg, 'From')
         subject = get_header(msg, 'Subject')
         body    = extract_plain_text(msg)
+
+        print(f"Processing '{subject}' from {sender}...")
 
         # Single GPT call: decide + draft
         system = {
@@ -102,6 +109,7 @@ def main(auto_send: bool = False):
 
         if result["should_reply"] == "YES":
             draft = result["draft_reply"].strip()
+            print("GPT suggests replying.")
             print(f"\nFrom: {sender}\nSubject: {subject}\n\nDraft:\n{draft}\n")
             send_it = auto_send
             if not auto_send:
@@ -111,17 +119,20 @@ def main(auto_send: bool = False):
                 mime['To'] = sender
                 mime['Subject'] = "Re: " + subject
                 raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+                print("Sending reply...")
                 service.users().messages().send(userId='me', body={'raw': raw}).execute()
                 print("✔ Sent!\n")
             else:
                 print("✘ Skipped.\n")
         else:
+            print("No reply needed according to GPT.")
             # mark as read to skip
             service.users().messages().modify(
                 userId='me',
                 id=msg['id'],
                 body={'removeLabelIds': ['UNREAD']}
             ).execute()
+            print("Marked as read.\n")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Process unread Gmail messages with GPT.')
