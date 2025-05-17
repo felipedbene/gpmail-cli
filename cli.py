@@ -14,7 +14,7 @@ SCOPES = [
 ]
 TOKEN_PATH = 'token.json'   
 
-load_dotenv()         # ← where to cache the creds
+load_dotenv()         # load configuration from .env
 OPENAI_KEY = os.getenv('OPENAI_API_KEY')
 if not OPENAI_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY; check your .env")
@@ -95,7 +95,6 @@ def main():
         except Exception as e:
             print(f"! Error parsing assistant response: {e}")
             result = {"should_reply": "NO", "draft_reply": ""}
-
 
         if result["should_reply"] == "YES":
             draft = result["draft_reply"].strip()
