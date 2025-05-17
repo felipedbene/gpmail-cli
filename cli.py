@@ -52,6 +52,28 @@ def get_header(message, name):
             return h['value']
     return ""
 
+def get_thread_messages(service, thread_id):
+    """Return messages in the thread sorted chronologically."""
+    thread = service.users().threads().get(
+        userId='me', id=thread_id, format='full'
+    ).execute()
+    msgs = thread.get('messages', [])
+    msgs.sort(key=lambda m: int(m.get('internalDate', '0')))
+    return msgs
+
+
+def build_thread_context(messages, current_id, max_messages=5):
+    """Build a text summary of previous messages in the thread."""
+    prior = [m for m in messages if m['id'] != current_id]
+    prior = prior[-max_messages:]
+    parts = []
+    for m in prior:
+        sender = get_header(m, 'From')
+        subject = get_header(m, 'Subject')
+        body = extract_plain_text(m)
+        parts.append(f"From: {sender}\nSubject: {subject}\n\n{body}")
+    return "\n\n".join(parts)
+
 def main(auto_send: bool = False, max_age_days: int = 7):
     creds   = get_credentials()
     service = build('gmail', 'v1', credentials=creds)
@@ -83,6 +105,9 @@ def main(auto_send: bool = False, max_age_days: int = 7):
         subject = get_header(msg, 'Subject')
         body = extract_plain_text(msg)
 
+        thread_msgs = get_thread_messages(service, msg.get('threadId'))
+        context = build_thread_context(thread_msgs, msg['id'])
+
         print(f"Processing '{subject}' from {sender}...")
 
         # Single GPT call: decide + draft
@@ -100,9 +125,13 @@ def main(auto_send: bool = False, max_age_days: int = 7):
                 "  • report_spam: \"YES\" if the message is spam or marketing, otherwise \"NO\"."
             )
         }
+        user_content = ""
+        if context:
+            user_content += f"Thread context:\n{context}\n\n"
+        user_content += f"From: {sender}\nSubject: {subject}\n\n{body}"
         user = {
             "role": "user",
-            "content": f"From: {sender}\nSubject: {subject}\n\n{body}"
+            "content": user_content,
         }
 
         try:
