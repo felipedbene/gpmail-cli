@@ -14,7 +14,7 @@ SCOPES = [
 ]
 TOKEN_PATH = 'token.json'   
 
-load_dotenv()         # ← where to cache the creds
+load_dotenv()         # load configuration from .env
 OPENAI_KEY = os.getenv('OPENAI_API_KEY')
 if not OPENAI_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY; check your .env")
