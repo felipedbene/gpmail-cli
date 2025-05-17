@@ -90,9 +90,24 @@ def is_mailing_list(message):
             return True
     return False
 
+def get_or_create_label(service, name: str) -> str:
+    """Return the Gmail label ID for ``name``, creating it if needed."""
+    resp = service.users().labels().list(userId='me').execute()
+    for lbl in resp.get('labels', []):
+        if lbl.get('name') == name:
+            return lbl['id']
+    body = {
+        'name': name,
+        'labelListVisibility': 'labelShow',
+        'messageListVisibility': 'show',
+    }
+    created = service.users().labels().create(userId='me', body=body).execute()
+    return created['id']
+
 def main(auto_send: bool = False, max_age_days: int = 7):
     creds   = get_credentials()
     service = build('gmail', 'v1', credentials=creds)
+    label_id = get_or_create_label(service, 'HumanActionNeeded-GPT')
     client = OpenAI(api_key=OPENAI_KEY)
     cutoff  = datetime.now(UTC) - timedelta(days=max_age_days)
 
@@ -149,9 +164,10 @@ def main(auto_send: bool = False, max_age_days: int = 7):
             "content": (
                 "You are an email assistant. "
                 "When a reply is required, draft it in the same language as the original email. "
-                "Output valid JSON with exactly two keys: "
+                "Output valid JSON with exactly three keys: "
                 "  • should_reply: \"YES\" or \"NO\"  "
-                "  • draft_reply: the reply text in the same language if should_reply is YES, otherwise empty string."
+                "  • draft_reply: the reply text in the same language if should_reply is YES, otherwise empty string. "
+                "  • reason: a short explanation if should_reply is NO, otherwise empty string."
             )
         }
         user_content = ""
@@ -176,16 +192,18 @@ def main(auto_send: bool = False, max_age_days: int = 7):
             if (
                 "should_reply" not in data
                 or "draft_reply" not in data
+                or "reason" not in data
             ):
                 raise ValueError("Missing keys in assistant response")
             result = {
                 "should_reply": data.get("should_reply", "").strip(),
                 "draft_reply": data.get("draft_reply", ""),
+                "reason": data.get("reason", ""),
             }
 
         except Exception as e:
             print(f"! Error parsing assistant response: {e}")
-            result = {"should_reply": "NO", "draft_reply": ""}
+            result = {"should_reply": "NO", "draft_reply": "", "reason": ""}
 
         if result["should_reply"] == "YES":
             draft = result["draft_reply"].strip()
@@ -205,11 +223,15 @@ def main(auto_send: bool = False, max_age_days: int = 7):
             else:
                 print("✘ Skipped.\n")
         else:
-            print("No reply needed according to GPT.")
+            reason = result.get("reason", "").strip()
+            if reason:
+                print(f"No reply needed according to GPT because {reason}.")
+            else:
+                print("No reply needed according to GPT.")
             service.users().messages().modify(
                 userId='me',
                 id=msg['id'],
-                body={'removeLabelIds': ['UNREAD']}
+                body={'removeLabelIds': ['UNREAD'], 'addLabelIds': [label_id]}
             ).execute()
             print("Marked as read.\n")
 
