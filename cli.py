@@ -1,6 +1,6 @@
 
 import os, json, base64, argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from email.mime.text import MIMEText
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2.credentials import Credentials
@@ -56,7 +56,7 @@ def main(auto_send: bool = False, max_age_days: int = 7):
     creds   = get_credentials()
     service = build('gmail', 'v1', credentials=creds)
     client = OpenAI(api_key=OPENAI_KEY)
-    cutoff  = datetime.utcnow() - timedelta(days=max_age_days)
+    cutoff  = datetime.now(UTC) - timedelta(days=max_age_days)
 
     print("Looking for unread messages...")
     gmail_resp = service.users().messages().list(userId='me', q='is:unread').execute()
@@ -67,7 +67,7 @@ def main(auto_send: bool = False, max_age_days: int = 7):
     for item in messages:
         msg = service.users().messages().get(userId='me', id=item['id'], format='full').execute()
         received_ts = int(msg.get('internalDate', '0')) / 1000
-        received_dt = datetime.utcfromtimestamp(received_ts) if received_ts else None
+        received_dt = datetime.fromtimestamp(received_ts, UTC) if received_ts else None
         if received_dt and received_dt < cutoff:
             service.users().messages().modify(
                 userId='me',
