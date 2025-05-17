@@ -79,6 +79,23 @@ def main():
             "content": f"From: {sender}\nSubject: {subject}\n\n{body}"
         }
 
+        try:
+            chat_resp = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[system, user],
+            )
+            assistant_content = chat_resp["choices"][0]["message"]["content"]
+            data = json.loads(assistant_content)
+            if not isinstance(data, dict):
+                raise ValueError("assistant reply must be an object")
+            result = {
+                "should_reply": data.get("should_reply", "").strip(),
+                "draft_reply": data.get("draft_reply", ""),
+            }
+        except Exception as e:
+            print(f"! Error parsing assistant response: {e}")
+            result = {"should_reply": "NO", "draft_reply": ""}
+
 
         if result["should_reply"] == "YES":
             draft = result["draft_reply"].strip()
