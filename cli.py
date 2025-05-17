@@ -74,6 +74,22 @@ def build_thread_context(messages, current_id, max_messages=5):
         parts.append(f"From: {sender}\nSubject: {subject}\n\n{body}")
     return "\n\n".join(parts)
 
+
+def is_important(message):
+    """Return True if Gmail marked this message as important."""
+    return 'IMPORTANT' in message.get('labelIds', [])
+
+
+def is_mailing_list(message):
+    """Detect if the message is from a mailing list or newsletter."""
+    labels = set(message.get('labelIds', []))
+    if labels.intersection({'CATEGORY_PROMOTIONS', 'CATEGORY_FORUMS', 'CATEGORY_UPDATES', 'CATEGORY_SOCIAL'}):
+        return True
+    for h in message.get('payload', {}).get('headers', []):
+        if h['name'].lower() in {'list-unsubscribe', 'list-id'}:
+            return True
+    return False
+
 def main(auto_send: bool = False, max_age_days: int = 7):
     creds   = get_credentials()
     service = build('gmail', 'v1', credentials=creds)
@@ -88,6 +104,23 @@ def main(auto_send: bool = False, max_age_days: int = 7):
         return
     for item in messages:
         msg = service.users().messages().get(userId='me', id=item['id'], format='full').execute()
+        labels = set(msg.get('labelIds', []))
+        if 'SPAM' in labels:
+            print("Skipping spam message.")
+            continue
+        if not is_important(msg):
+            service.users().messages().modify(
+                userId='me', id=msg['id'], body={'removeLabelIds': ['UNREAD']}
+            ).execute()
+            print("Skipping not-important message.")
+            continue
+        if is_mailing_list(msg):
+            service.users().messages().modify(
+                userId='me', id=msg['id'], body={'removeLabelIds': ['UNREAD']}
+            ).execute()
+            print("Skipping mailing list or automated message.")
+            continue
+
         received_ts = int(msg.get('internalDate', '0')) / 1000
         received_dt = datetime.fromtimestamp(received_ts, UTC) if received_ts else None
         if received_dt and received_dt < cutoff:
@@ -115,14 +148,10 @@ def main(auto_send: bool = False, max_age_days: int = 7):
             "role": "system",
             "content": (
                 "You are an email assistant. "
-                "Never respond to marketing or promotional messages even if they appear well written. "
-                "Be conservative when deciding a message is spam. Legitimate security notices, such as bank alerts about suspicious activity, are not marketing and should not be reported as spam. "
-                "Determine whether the email is spam or marketing and should be reported. "
                 "When a reply is required, draft it in the same language as the original email. "
-                "Output valid JSON with exactly three keys: "
+                "Output valid JSON with exactly two keys: "
                 "  • should_reply: \"YES\" or \"NO\"  "
-                "  • draft_reply: the reply text in the same language if should_reply is YES, otherwise empty string. "
-                "  • report_spam: \"YES\" if the message is spam or marketing, otherwise \"NO\"."
+                "  • draft_reply: the reply text in the same language if should_reply is YES, otherwise empty string."
             )
         }
         user_content = ""
@@ -147,18 +176,16 @@ def main(auto_send: bool = False, max_age_days: int = 7):
             if (
                 "should_reply" not in data
                 or "draft_reply" not in data
-                or "report_spam" not in data
             ):
                 raise ValueError("Missing keys in assistant response")
             result = {
                 "should_reply": data.get("should_reply", "").strip(),
                 "draft_reply": data.get("draft_reply", ""),
-                "report_spam": data.get("report_spam", "").strip(),
             }
 
         except Exception as e:
             print(f"! Error parsing assistant response: {e}")
-            result = {"should_reply": "NO", "draft_reply": "", "report_spam": "NO"}
+            result = {"should_reply": "NO", "draft_reply": ""}
 
         if result["should_reply"] == "YES":
             draft = result["draft_reply"].strip()
@@ -179,25 +206,12 @@ def main(auto_send: bool = False, max_age_days: int = 7):
                 print("✘ Skipped.\n")
         else:
             print("No reply needed according to GPT.")
-            if result.get("report_spam", "NO") == "YES":
-                # mark as spam and remove from inbox
-                service.users().messages().modify(
-                    userId='me',
-                    id=msg['id'],
-                    body={
-                        'addLabelIds': ['SPAM'],
-                        'removeLabelIds': ['UNREAD', 'INBOX']
-                    }
-                ).execute()
-                print("Reported as spam.\n")
-            else:
-                # mark as read to skip
-                service.users().messages().modify(
-                    userId='me',
-                    id=msg['id'],
-                    body={'removeLabelIds': ['UNREAD']}
-                ).execute()
-                print("Marked as read.\n")
+            service.users().messages().modify(
+                userId='me',
+                id=msg['id'],
+                body={'removeLabelIds': ['UNREAD']}
+            ).execute()
+            print("Marked as read.\n")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Process unread Gmail messages with GPT.')

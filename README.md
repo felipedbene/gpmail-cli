@@ -45,5 +45,5 @@ python cli.py [--auto-send]
 Use `--auto-send` to send replies automatically without manual confirmation.
 `--max-age-days` controls how old unread messages can be before they are ignored (default: 7 days).
 
-The script checks your unread emails, uses GPT to decide if a response is needed and, when appropriate, drafts a reply for you to send.
-Replies are written in the same language as the incoming email. Messages that are detected as spam or marketing are automatically reported to Gmail instead of just being marked read.
+The script checks your unread emails labelled as **Important**, skips newsletters and mailing lists when Gmail identifies them, and uses GPT only to decide if a response is needed and draft a reply when appropriate.
+Replies are written in the same language as the incoming email. Messages not requiring a reply are simply marked as read.
