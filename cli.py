@@ -14,7 +14,7 @@ SCOPES = [
 ]
 TOKEN_PATH = 'token.json'   
 
-load_dotenv()         # ← where to cache the creds
+load_dotenv()         # load configuration from .env
 OPENAI_KEY = os.getenv('OPENAI_API_KEY')
 if not OPENAI_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY; check your .env")
@@ -78,17 +78,29 @@ def main(auto_send: bool = False):
             "role": "user",
             "content": f"From: {sender}\nSubject: {subject}\n\n{body}"
         }
+
         try:
-            resp = openai.ChatCompletion.create(
+            chat_resp = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
                 messages=[system, user],
             )
+
             result = json.loads(resp["choices"][0]["message"]["content"])
             if "should_reply" not in result or "draft_reply" not in result:
                 raise ValueError("Missing keys in assistant response")
+
+            assistant_content = chat_resp["choices"][0]["message"]["content"]
+            data = json.loads(assistant_content)
+            if not isinstance(data, dict):
+                raise ValueError("assistant reply must be an object")
+            result = {
+                "should_reply": data.get("should_reply", "").strip(),
+                "draft_reply": data.get("draft_reply", ""),
+            }
+
         except Exception as e:
-            print("Failed to generate reply:", e)
-            continue
+            print(f"! Error parsing assistant response: {e}")
+            result = {"should_reply": "NO", "draft_reply": ""}
 
         if result["should_reply"] == "YES":
             draft = result["draft_reply"].strip()
