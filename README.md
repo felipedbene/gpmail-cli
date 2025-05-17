@@ -47,3 +47,13 @@ Use `--auto-send` to send replies automatically without manual confirmation.
 
 The script checks your unread emails labelled as **Important**, skips newsletters and mailing lists when Gmail identifies them, and uses GPT only to decide if a response is needed and draft a reply when appropriate.
 Replies are written in the same language as the incoming email. When GPT decides no reply is needed, its reasoning is shown and the message is labeled `HumanActionNeeded-GPT` before being marked as read.
+
+## Summarize a thread
+
+To generate a Markdown summary of a specific email thread, search by sender or subject with:
+
+```bash
+python summarize_thread.py "from:someone@example.com" --output summary.md
+```
+
+The script finds the first matching thread, orders messages chronologically, summarizes each with GPT, and writes a narrative overview to the specified Markdown file.
