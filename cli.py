@@ -1,66 +1,18 @@
 
-import os, json, base64, argparse
+import os, json, argparse, re
 from datetime import datetime, timedelta, UTC
 from email.mime.text import MIMEText
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
 from openai import OpenAI
-from google.auth.transport.requests import Request
 from dotenv import load_dotenv
-SCOPES = [
-    'https://www.googleapis.com/auth/gmail.readonly',
-    'https://www.googleapis.com/auth/gmail.compose',
-    'https://www.googleapis.com/auth/gmail.modify'
-]
-TOKEN_PATH = 'token.json'   
-
+from collections import defaultdict
+from googleapiclient.discovery import build
+from utils.gmail_utils import get_credentials, get_header, extract_plain_text, get_thread_messages, is_important, is_mailing_list, get_or_create_label, search_messages
+from utils.ai_utils import categorize_email, detect_sentiment, extract_entities, summarize_text
+from utils.analytics_utils import identify_key_participants, generate_timeline
 load_dotenv()         # load configuration from .env
 OPENAI_KEY = os.getenv('OPENAI_API_KEY')
 if not OPENAI_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY; check your .env")
-
-def get_credentials():
-    creds = None
-    # 1) Load cached credentials if they exist
-    if os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-    # 2) If no creds or expired, refresh or re-run the flow
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0, open_browser=False)
-        # 3) Save the fresh credentials back to token.json
-        with open(TOKEN_PATH, 'w') as f:
-            f.write(creds.to_json())
-    return creds
-
-def extract_plain_text(message):
-    payload = message.get('payload', {})
-    if payload.get('mimeType') == 'text/plain' and payload.get('body', {}).get('data'):
-        return base64.urlsafe_b64decode(payload['body']['data']).decode()
-    for part in payload.get('parts', []):
-        if part.get('mimeType') == 'text/plain' and part.get('body', {}).get('data'):
-            return base64.urlsafe_b64decode(part['body']['data']).decode()
-    return ""
-
-def get_header(message, name):
-    for h in message['payload'].get('headers', []):
-        if h['name'].lower() == name.lower():
-            return h['value']
-    return ""
-
-def get_thread_messages(service, thread_id):
-    """Return messages in the thread sorted chronologically."""
-    thread = service.users().threads().get(
-        userId='me', id=thread_id, format='full'
-    ).execute()
-    msgs = thread.get('messages', [])
-    msgs.sort(key=lambda m: int(m.get('internalDate', '0')))
-    return msgs
-
 
 def build_thread_context(messages, current_id, max_messages=5):
     """Build a text summary of previous messages in the thread."""
@@ -74,42 +26,168 @@ def build_thread_context(messages, current_id, max_messages=5):
         parts.append(f"From: {sender}\nSubject: {subject}\n\n{body}")
     return "\n\n".join(parts)
 
+def build_enhanced_thread_context(messages, current_id, client, max_messages=8):
+    """Build an enhanced context with semantic analysis of previous messages."""
+    prior = [m for m in messages if m['id'] != current_id]
+    prior = prior[-max_messages:]
+    parts = []
+    
+    for m in prior:
+        sender = get_header(m, 'From')
+        subject = get_header(m, 'Subject')
+        body = extract_plain_text(m)
+        
+        # Get category and sentiment for each message
+        category_info = categorize_email(sender, subject, body, client)
+        sentiment_info = detect_sentiment(sender, subject, body, client)
+        
+        context_part = f"From: {sender}\nSubject: {subject}\nCategory: {category_info['category']} (confidence: {category_info['confidence']:.2f})\nSentiment: {sentiment_info['sentiment']} (intensity: {sentiment_info['intensity']:.2f})\n\n{body}"
+        parts.append(context_part)
+    
+    return "\n\n---\n\n".join(parts)
 
-def is_important(message):
-    """Return True if Gmail marked this message as important."""
-    return 'IMPORTANT' in message.get('labelIds', [])
+def summarize_thread(query, output_path, client, service, include_entities=True, include_timeline=True):
+    """Summarize an email thread based on a search query."""
+    print(f"Searching for thread with query: {query}")
+    
+    search_results = search_messages(service, query)
+    if not search_results:
+        print('No messages found for query.')
+        return
 
+    thread_id = search_results[0]['threadId']
+    messages = get_thread_messages(service, thread_id)
 
-def is_mailing_list(message):
-    """Detect if the message is from a mailing list or newsletter."""
-    labels = set(message.get('labelIds', []))
-    if labels.intersection({'CATEGORY_PROMOTIONS', 'CATEGORY_FORUMS', 'CATEGORY_UPDATES', 'CATEGORY_SOCIAL'}):
-        return True
-    for h in message.get('payload', {}).get('headers', []):
-        if h['name'].lower() in {'list-unsubscribe', 'list-id'}:
-            return True
-    return False
+    print(f"Processing thread with {len(messages)} messages...")
 
-def get_or_create_label(service, name: str) -> str:
-    """Return the Gmail label ID for ``name``, creating it if needed."""
-    resp = service.users().labels().list(userId='me').execute()
-    for lbl in resp.get('labels', []):
-        if lbl.get('name') == name:
-            return lbl['id']
-    body = {
-        'name': name,
-        'labelListVisibility': 'labelShow',
-        'messageListVisibility': 'show',
+    # Extract thread metadata
+    participants = identify_key_participants(messages, get_header)
+    timeline = generate_timeline(messages, get_header) if include_timeline else []
+    
+    summaries = []
+    all_entities = {
+        "people": [],
+        "organizations": [],
+        "dates": [],
+        "action_items": []
     }
-    created = service.users().labels().create(userId='me', body=body).execute()
-    return created['id']
+    
+    for msg in messages:
+        sender = get_header(msg, 'From')
+        subject = get_header(msg, 'Subject')
+        received_ts = int(msg.get('internalDate', '0')) / 1000
+        received_dt = datetime.fromtimestamp(received_ts, UTC)
+        body = extract_plain_text(msg)
+        
+        # Get summary
+        summary = summarize_text(client, body)
+        
+        # Get category
+        category = categorize_email(sender, subject, body, client)['category']
+        
+        # Extract entities if requested
+        entities = extract_entities(body, client) if include_entities else {}
+        if include_entities:
+            all_entities["people"].extend(entities.get("people", []))
+            all_entities["organizations"].extend(entities.get("organizations", []))
+            all_entities["dates"].extend(entities.get("dates", []))
+            all_entities["action_items"].extend(entities.get("action_items", []))
+        
+        summaries.append({
+            'sender': sender,
+            'subject': subject,
+            'received': received_dt.isoformat(),
+            'summary': summary,
+            'category': category,
+            'entities': entities if include_entities else {}
+        })
 
-def main(auto_send: bool = False, max_age_days: int = 7):
-    creds   = get_credentials()
+    # Generate overall summary
+    overall_text = '\n\n'.join([f"From: {s['sender']}\nSubject: {s['subject']}\nCategory: {s['category']}\n{s['summary']}" for s in summaries])
+    overall_summary = summarize_text(client, overall_text)
+
+    # Write output file
+    with open(output_path, 'w') as f:
+        f.write(f"# Thread Summary\n\n")
+        f.write(f"Query: {query}\n")
+        f.write(f"Messages: {len(messages)}\n")
+        f.write(f"Participants: {len(participants)}\n\n")
+        
+        # Key participants
+        f.write(f"## Key Participants\n")
+        for participant, count in participants:
+            f.write(f"- {participant} ({count} messages)\n")
+        f.write(f"\n")
+        
+        # Timeline
+        if include_timeline and timeline:
+            f.write(f"## Timeline\n")
+            for event in timeline:
+                f.write(f"- {event['timestamp'].strftime('%Y-%m-%d %H:%M')} - {event['sender']}: {event['subject']}\n")
+            f.write(f"\n")
+        
+        # Entities
+        if include_entities:
+            f.write(f"## Extracted Entities\n")
+            f.write(f"### People\n")
+            for person in list(set(all_entities["people"])):
+                f.write(f"- {person}\n")
+            f.write(f"\n### Organizations\n")
+            for org in list(set(all_entities["organizations"])):
+                f.write(f"- {org}\n")
+            f.write(f"\n### Dates\n")
+            for date in list(set(all_entities["dates"])):
+                f.write(f"- {date}\n")
+            f.write(f"\n### Action Items\n")
+            for action in list(set(all_entities["action_items"])):
+                f.write(f"- {action}\n")
+            f.write(f"\n")
+        
+        # Individual message summaries
+        f.write(f"## Message Summaries\n")
+        for s in summaries:
+            f.write(f"### {s['subject']} ({s['received']})\n")
+            f.write(f"From: {s['sender']}\n")
+            f.write(f"Category: {s['category']}\n\n")
+            f.write(f"{s['summary']}\n\n")
+            
+            # Message-specific entities
+            if include_entities and s['entities']:
+                entities = s['entities']
+                if entities.get("action_items"):
+                    f.write(f"Action items:\n")
+                    for action in entities["action_items"]:
+                        f.write(f"- {action}\n")
+                    f.write(f"\n")
+        
+        # Overall narrative
+        f.write(f"## Overall Narrative\n\n{overall_summary}\n")
+
+    print(f"Summary written to {output_path}")
+
+def main(auto_send: bool = False, max_age_days: int = 7, enable_enhanced: bool = True, 
+         summarize_query: str = None, output_path: str = "thread_summary.md", 
+         disable_entities: bool = False, disable_timeline: bool = False, no_age_limit: bool = False):
+    
+    creds = get_credentials()
     service = build('gmail', 'v1', credentials=creds)
-    label_id = get_or_create_label(service, 'HumanActionNeeded-GPT')
     client = OpenAI(api_key=OPENAI_KEY)
-    cutoff  = datetime.now(UTC) - timedelta(days=max_age_days)
+    
+    # Handle thread summarization mode
+    if summarize_query:
+        summarize_thread(
+            query=summarize_query,
+            output_path=output_path,
+            client=client,
+            service=service,
+            include_entities=not disable_entities,
+            include_timeline=not disable_timeline
+        )
+        return
+    
+    # Handle email processing mode (original functionality)
+    label_id = get_or_create_label(service, 'HumanActionNeeded-GPT')
+    cutoff  = datetime.now(UTC) - timedelta(days=max_age_days) if not no_age_limit else None
 
     print("Looking for unread messages...")
     gmail_resp = service.users().messages().list(userId='me', q='is:unread').execute()
@@ -117,6 +195,16 @@ def main(auto_send: bool = False, max_age_days: int = 7):
     print(f"Found {len(messages)} unread message(s)")
     if not messages:
         return
+        
+    # Track email statistics
+    stats = {
+        "total_processed": 0,
+        "replied": 0,
+        "skipped": 0,
+        "categories": defaultdict(int),
+        "sentiments": defaultdict(int)
+    }
+    
     for item in messages:
         msg = service.users().messages().get(userId='me', id=item['id'], format='full').execute()
         labels = set(msg.get('labelIds', []))
@@ -154,20 +242,44 @@ def main(auto_send: bool = False, max_age_days: int = 7):
         body = extract_plain_text(msg)
 
         thread_msgs = get_thread_messages(service, msg.get('threadId'))
-        context = build_thread_context(thread_msgs, msg['id'])
+        
+        # Enhanced intelligence features
+        if enable_enhanced:
+            # Categorize the email
+            category_info = categorize_email(sender, subject, body, client)
+            print(f"Category: {category_info['category']} (confidence: {category_info['confidence']:.2f})")
+            stats["categories"][category_info['category']] += 1
+            
+            # Detect sentiment
+            sentiment_info = detect_sentiment(sender, subject, body, client)
+            print(f"Sentiment: {sentiment_info['sentiment']} (intensity: {sentiment_info['intensity']:.2f})")
+            stats["sentiments"][sentiment_info['sentiment']] += 1
+            
+            # Extract entities
+            entities = extract_entities(body, client)
+            if entities["action_items"]:
+                print(f"Action items detected: {len(entities['action_items'])}")
+            
+            # Build enhanced context
+            context = build_enhanced_thread_context(thread_msgs, msg['id'], client)
+        else:
+            # Use original context building
+            context = build_thread_context(thread_msgs, msg['id'])
 
         print(f"Processing '{subject}' from {sender}...")
 
-        # Single GPT call: decide + draft
+        # Enhanced GPT call with more detailed instructions
         system = {
             "role": "system",
             "content": (
-                "You are an email assistant. "
+                "You are an intelligent email assistant with advanced capabilities. "
                 "When a reply is required, draft it in the same language as the original email. "
-                "Output valid JSON with exactly three keys: "
+                "Consider the email category, sentiment, and any action items when deciding to reply. "
+                "Output valid JSON with exactly four keys: "
                 "  • should_reply: \"YES\" or \"NO\"  "
                 "  • draft_reply: the reply text in the same language if should_reply is YES, otherwise empty string. "
                 "  • reason: a short explanation if should_reply is NO, otherwise empty string."
+                "  • priority: \"high\", \"medium\", or \"low\" indicating response urgency"
             )
         }
         user_content = ""
@@ -199,15 +311,19 @@ def main(auto_send: bool = False, max_age_days: int = 7):
                 "should_reply": data.get("should_reply", "").strip(),
                 "draft_reply": data.get("draft_reply", ""),
                 "reason": data.get("reason", ""),
+                "priority": data.get("priority", "medium"),
             }
 
         except Exception as e:
             print(f"! Error parsing assistant response: {e}")
-            result = {"should_reply": "NO", "draft_reply": "", "reason": ""}
+            result = {"should_reply": "NO", "draft_reply": "", "reason": "", "priority": "medium"}
 
+        stats["total_processed"] += 1
+        
         if result["should_reply"] == "YES":
             draft = result["draft_reply"].strip()
-            print("GPT suggests replying.")
+            priority = result.get("priority", "medium")
+            print(f"GPT suggests replying (Priority: {priority.upper()}).")
             print(f"\nFrom: {sender}\nSubject: {subject}\n\nDraft:\n{draft}\n")
             send_it = auto_send
             if not auto_send:
@@ -220,25 +336,69 @@ def main(auto_send: bool = False, max_age_days: int = 7):
                 print("Sending reply...")
                 service.users().messages().send(userId='me', body={'raw': raw}).execute()
                 print("✔ Sent!\n")
+                stats["replied"] += 1
             else:
                 print("✘ Skipped.\n")
+                stats["skipped"] += 1
         else:
             reason = result.get("reason", "").strip()
+            priority = result.get("priority", "medium")
             if reason:
-                print(f"No reply needed according to GPT because {reason}.")
+                print(f"No reply needed according to GPT (Priority: {priority.upper()}) because {reason}.")
             else:
-                print("No reply needed according to GPT.")
+                print(f"No reply needed according to GPT (Priority: {priority.upper()}).")
             service.users().messages().modify(
                 userId='me',
                 id=msg['id'],
                 body={'removeLabelIds': ['UNREAD'], 'addLabelIds': [label_id]}
             ).execute()
             print("Marked as read.\n")
+            stats["skipped"] += 1
+    
+    # Print statistics
+    print("\n--- Processing Summary ---")
+    print(f"Total processed: {stats['total_processed']}")
+    print(f"Replied: {stats['replied']}")
+    print(f"Skipped: {stats['skipped']}")
+    print("\nCategories:")
+    for category, count in stats["categories"].items():
+        print(f"  {category}: {count}")
+    print("\nSentiments:")
+    for sentiment, count in stats["sentiments"].items():
+        print(f"  {sentiment}: {count}")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Process unread Gmail messages with GPT.')
-    parser.add_argument('--auto-send', action='store_true', help='Send replies without confirmation')
+    parser = argparse.ArgumentParser(description='Process unread Gmail messages with GPT or summarize email threads.')
+    parser.add_argument('--auto-send', action='store_true', help='Send replies without confirmation (email processing mode only)')
     parser.add_argument('--max-age-days', type=int, default=7,
-                        help='Ignore unread messages older than this many days')
+                        help='Ignore unread messages older than this many days (email processing mode only)')
+    parser.add_argument('--disable-enhanced', action='store_true', 
+                        help='Disable enhanced intelligence features')
+    
+    # Thread summarization arguments
+    parser.add_argument('--summarize', type=str, metavar='QUERY',
+                        help='Summarize an email thread matching the given Gmail search query')
+    parser.add_argument('--output', type=str, default='thread_summary.md',
+                        help='Output file path for thread summary (default: thread_summary.md)')
+    parser.add_argument('--no-entities', action='store_true',
+                        help='Disable entity extraction for thread summarization')
+    parser.add_argument('--no-timeline', action='store_true',
+                        help='Disable timeline generation for thread summarization')
+    
     args = parser.parse_args()
-    main(auto_send=args.auto_send, max_age_days=args.max_age_days)
+    
+    if args.summarize:
+        # Run in thread summarization mode
+        main(
+            summarize_query=args.summarize,
+            output_path=args.output,
+            disable_entities=args.no_entities,
+            disable_timeline=args.no_timeline
+        )
+    else:
+        # Run in email processing mode (original functionality)
+        main(
+            auto_send=args.auto_send,
+            max_age_days=args.max_age_days,
+            enable_enhanced=not args.disable_enhanced
+        )
