@@ -1,5 +1,5 @@
 
-import os, json, argparse, re
+import os, json, argparse, re, base64
 from datetime import datetime, timedelta, UTC
 from email.mime.text import MIMEText
 from openai import OpenAI
@@ -46,124 +46,167 @@ def build_enhanced_thread_context(messages, current_id, client, max_messages=8):
     
     return "\n\n---\n\n".join(parts)
 
-def summarize_thread(query, output_path, client, service, include_entities=True, include_timeline=True):
-    """Summarize an email thread based on a search query."""
-    print(f"Searching for thread with query: {query}")
+def summarize_threads(query, output_path, client, service, include_entities=True, include_timeline=True, max_threads=5):
+    """Summarize multiple email threads based on a search query."""
+    print(f"Searching for threads with query: {query}")
     
-    search_results = search_messages(service, query)
-    if not search_results:
-        print('No messages found for query.')
-        return
+    try:
+        # Get all messages matching the query
+        search_results = search_messages(service, query)
+        if not search_results:
+            print('No messages found for query.')
+            return
 
-    thread_id = search_results[0]['threadId']
-    messages = get_thread_messages(service, thread_id)
+        # Group messages by thread ID
+        threads = {}
+        for msg in search_results:
+            thread_id = msg['threadId']
+            if thread_id not in threads:
+                threads[thread_id] = []
+            threads[thread_id].append(msg)
+        
+        print(f"Found {len(threads)} threads with {len(search_results)} total messages")
+        
+        # Limit to max_threads
+        thread_ids = list(threads.keys())[:max_threads]
+        print(f"Processing {len(thread_ids)} threads (limited to {max_threads})")
+        
+        all_thread_summaries = []
+        all_participants = []
+        
+        for i, thread_id in enumerate(thread_ids):
+            try:
+                print(f"\nProcessing thread {i+1}/{len(thread_ids)}...")
+                messages = get_thread_messages(service, thread_id)
+                
+                # Extract thread metadata
+                participants = identify_key_participants(messages, get_header)
+                timeline = generate_timeline(messages, get_header) if include_timeline else []
+                all_participants.extend(participants)
+                
+                thread_summaries = []
+                thread_entities = {
+                    "people": [],
+                    "organizations": [],
+                    "dates": [],
+                    "action_items": []
+                }
+                
+                for msg in messages:
+                    try:
+                        sender = get_header(msg, 'From')
+                        subject = get_header(msg, 'Subject')
+                        received_ts = int(msg.get('internalDate', '0')) / 1000
+                        received_dt = datetime.fromtimestamp(received_ts, UTC)
+                        body = extract_plain_text(msg)
+                        
+                        # Get summary
+                        print(f"Generating summary for message: {subject[:50]}...")
+                        summary = summarize_text(client, body)
+                        
+                        # Get category
+                        print(f"Categorizing email: {subject[:50]}...")
+                        category = categorize_email(sender, subject, body, client)['category']
+                        
+                        # Extract entities if requested
+                        entities = extract_entities(body, client) if include_entities else {}
+                        if include_entities:
+                            thread_entities["people"].extend(entities.get("people", []))
+                            thread_entities["organizations"].extend(entities.get("organizations", []))
+                            thread_entities["dates"].extend(entities.get("dates", []))
+                            thread_entities["action_items"].extend(entities.get("action_items", []))
+                        
+                        thread_summaries.append({
+                            'sender': sender,
+                            'subject': subject,
+                            'received': received_dt.isoformat(),
+                            'summary': summary,
+                            'category': category,
+                            'entities': entities if include_entities else {}
+                        })
+                    except Exception as e:
+                        print(f"Error processing message in thread {thread_id}: {e}")
+                        continue
 
-    print(f"Processing thread with {len(messages)} messages...")
+                # Generate thread overall summary
+                print("Generating overall thread summary...")
+                overall_text = '\n\n'.join([f"From: {s['sender']}\nSubject: {s['subject']}\nCategory: {s['category']}\n{s['summary']}" for s in thread_summaries])
+                overall_summary = summarize_text(client, overall_text)
+                
+                all_thread_summaries.append({
+                    'thread_id': thread_id,
+                    'messages': len(messages),
+                    'participants': participants,
+                    'timeline': timeline,
+                    'summaries': thread_summaries,
+                    'entities': thread_entities,
+                    'overall_summary': overall_summary
+                })
+            except Exception as e:
+                print(f"Error processing thread {thread_id}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
 
-    # Extract thread metadata
-    participants = identify_key_participants(messages, get_header)
-    timeline = generate_timeline(messages, get_header) if include_timeline else []
-    
-    summaries = []
-    all_entities = {
-        "people": [],
-        "organizations": [],
-        "dates": [],
-        "action_items": []
-    }
-    
-    for msg in messages:
-        sender = get_header(msg, 'From')
-        subject = get_header(msg, 'Subject')
-        received_ts = int(msg.get('internalDate', '0')) / 1000
-        received_dt = datetime.fromtimestamp(received_ts, UTC)
-        body = extract_plain_text(msg)
-        
-        # Get summary
-        summary = summarize_text(client, body)
-        
-        # Get category
-        category = categorize_email(sender, subject, body, client)['category']
-        
-        # Extract entities if requested
-        entities = extract_entities(body, client) if include_entities else {}
-        if include_entities:
-            all_entities["people"].extend(entities.get("people", []))
-            all_entities["organizations"].extend(entities.get("organizations", []))
-            all_entities["dates"].extend(entities.get("dates", []))
-            all_entities["action_items"].extend(entities.get("action_items", []))
-        
-        summaries.append({
-            'sender': sender,
-            'subject': subject,
-            'received': received_dt.isoformat(),
-            'summary': summary,
-            'category': category,
-            'entities': entities if include_entities else {}
-        })
-
-    # Generate overall summary
-    overall_text = '\n\n'.join([f"From: {s['sender']}\nSubject: {s['subject']}\nCategory: {s['category']}\n{s['summary']}" for s in summaries])
-    overall_summary = summarize_text(client, overall_text)
-
-    # Write output file
-    with open(output_path, 'w') as f:
-        f.write(f"# Thread Summary\n\n")
-        f.write(f"Query: {query}\n")
-        f.write(f"Messages: {len(messages)}\n")
-        f.write(f"Participants: {len(participants)}\n\n")
-        
-        # Key participants
-        f.write(f"## Key Participants\n")
-        for participant, count in participants:
-            f.write(f"- {participant} ({count} messages)\n")
-        f.write(f"\n")
-        
-        # Timeline
-        if include_timeline and timeline:
-            f.write(f"## Timeline\n")
-            for event in timeline:
-                f.write(f"- {event['timestamp'].strftime('%Y-%m-%d %H:%M')} - {event['sender']}: {event['subject']}\n")
-            f.write(f"\n")
-        
-        # Entities
-        if include_entities:
-            f.write(f"## Extracted Entities\n")
-            f.write(f"### People\n")
-            for person in list(set(all_entities["people"])):
-                f.write(f"- {person}\n")
-            f.write(f"\n### Organizations\n")
-            for org in list(set(all_entities["organizations"])):
-                f.write(f"- {org}\n")
-            f.write(f"\n### Dates\n")
-            for date in list(set(all_entities["dates"])):
-                f.write(f"- {date}\n")
-            f.write(f"\n### Action Items\n")
-            for action in list(set(all_entities["action_items"])):
-                f.write(f"- {action}\n")
-            f.write(f"\n")
-        
-        # Individual message summaries
-        f.write(f"## Message Summaries\n")
-        for s in summaries:
-            f.write(f"### {s['subject']} ({s['received']})\n")
-            f.write(f"From: {s['sender']}\n")
-            f.write(f"Category: {s['category']}\n\n")
-            f.write(f"{s['summary']}\n\n")
+        # Write output file
+        print("Writing output file...")
+        with open(output_path, 'w') as f:
+            f.write(f"# Multiple Thread Summary\n\n")
+            f.write(f"Query: {query}\n")
+            f.write(f"Threads processed: {len(thread_ids)}\n")
+            f.write(f"Total messages: {sum(t['messages'] for t in all_thread_summaries)}\n\n")
             
-            # Message-specific entities
-            if include_entities and s['entities']:
-                entities = s['entities']
-                if entities.get("action_items"):
-                    f.write(f"Action items:\n")
-                    for action in entities["action_items"]:
-                        f.write(f"- {action}\n")
-                    f.write(f"\n")
-        
-        # Overall narrative
-        f.write(f"## Overall Narrative\n\n{overall_summary}\n")
+            # Key participants across all threads
+            f.write(f"## Key Participants\n")
+            participant_counts = {}
+            for participant, count in all_participants:
+                if participant not in participant_counts:
+                    participant_counts[participant] = 0
+                participant_counts[participant] += count
+            sorted_participants = sorted(participant_counts.items(), key=lambda x: x[1], reverse=True)
+            for participant, count in sorted_participants[:10]:  # Top 10 participants
+                f.write(f"- {participant} ({count} messages)\n")
+            f.write(f"\n")
+            
+            # Individual thread summaries
+            f.write(f"## Thread Summaries\n")
+            for i, thread_summary in enumerate(all_thread_summaries):
+                f.write(f"### Thread {i+1}\n")
+                f.write(f"Messages: {thread_summary['messages']}\n")
+                f.write(f"Participants: {len(thread_summary['participants'])}\n\n")
+                
+                # Message summaries for this thread
+                for s in thread_summary['summaries']:
+                    f.write(f"#### {s['subject']} ({s['received']})\n")
+                    f.write(f"From: {s['sender']}\n")
+                    f.write(f"Category: {s['category']}\n\n")
+                    f.write(f"{s['summary']}\n\n")
+                    
+                    # Message-specific entities
+                    if include_entities and s['entities']:
+                        entities = s['entities']
+                        if entities.get("action_items"):
+                            f.write(f"Action items:\n")
+                            for action in entities["action_items"]:
+                                f.write(f"- {action}\n")
+                            f.write(f"\n")
+                
+                # Thread overall narrative
+                f.write(f"##### Thread Narrative\n\n{thread_summary['overall_summary']}\n\n")
+            
+            # Overall summary across all threads
+            f.write(f"## Overall Summary\n")
+            all_narratives = [t['overall_summary'] for t in all_thread_summaries]
+            combined_narrative_text = '\n\n'.join(all_narratives)
+            final_overall_summary = summarize_text(client, f"Summarize these thread summaries:\n\n{combined_narrative_text}")
+            f.write(f"{final_overall_summary}\n")
 
-    print(f"Summary written to {output_path}")
+        print(f"Summary written to {output_path}")
+    except Exception as e:
+        print(f"Error in summarize_threads: {e}")
+        import traceback
+        traceback.print_exc()
+
 
 def main(auto_send: bool = False, max_age_days: int = 7, enable_enhanced: bool = True, 
          summarize_query: str = None, output_path: str = "thread_summary.md", 
@@ -175,7 +218,7 @@ def main(auto_send: bool = False, max_age_days: int = 7, enable_enhanced: bool =
     
     # Handle thread summarization mode
     if summarize_query:
-        summarize_thread(
+        summarize_threads(
             query=summarize_query,
             output_path=output_path,
             client=client,
@@ -226,7 +269,7 @@ def main(auto_send: bool = False, max_age_days: int = 7, enable_enhanced: bool =
 
         received_ts = int(msg.get('internalDate', '0')) / 1000
         received_dt = datetime.fromtimestamp(received_ts, UTC) if received_ts else None
-        if received_dt and received_dt < cutoff:
+        if cutoff and received_dt and received_dt < cutoff:
             service.users().messages().modify(
                 userId='me',
                 id=msg['id'],
@@ -374,6 +417,8 @@ if __name__ == '__main__':
                         help='Ignore unread messages older than this many days (email processing mode only)')
     parser.add_argument('--disable-enhanced', action='store_true', 
                         help='Disable enhanced intelligence features')
+    parser.add_argument('--no-age-limit', action='store_true',
+                        help='Process all unread messages regardless of age (email processing mode only)')
     
     # Thread summarization arguments
     parser.add_argument('--summarize', type=str, metavar='QUERY',
@@ -400,5 +445,6 @@ if __name__ == '__main__':
         main(
             auto_send=args.auto_send,
             max_age_days=args.max_age_days,
-            enable_enhanced=not args.disable_enhanced
+            enable_enhanced=not args.disable_enhanced,
+            no_age_limit=args.no_age_limit
         )
